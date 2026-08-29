@@ -62,7 +62,18 @@ public class SubsonicAuthenticationMiddleware
             await _next(context);
             return;
         }
-        
+
+        // /rest/ping is a connectivity probe. Subsonic clients (Symfonium) call it
+        // with placeholder credentials to identify the server before applying the
+        // user's real ones, and they expect an OpenSubsonic-shaped body that names
+        // the server even when auth is wrong. Proxy it to the backing Subsonic
+        // server and relay that response verbatim rather than 401-ing.
+        if (path.StartsWith("/rest/ping", StringComparison.OrdinalIgnoreCase))
+        {
+            await ProxyPingAsync(context, requestParser);
+            return;
+        }
+
         // Extract authentication parameters
         var parameters = await requestParser.ExtractAllParametersAsync(context.Request);
         
@@ -100,6 +111,20 @@ public class SubsonicAuthenticationMiddleware
         if (!isValid)
         {
             _logger.LogWarning("Authentication failed: invalid credentials for user {User} on {Path}", username, path);
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                var safe = parameters
+                    .Where(kv => kv.Key is not ("p" or "t" or "s"))
+                    .Select(kv => $"{kv.Key}={kv.Value}");
+                _logger.LogDebug(
+                    "Auth debug: params [{Params}] hasP={HasP} hasT={HasT} hasS={HasS} authHeader={AuthHeader} subsonicUrl={SubsonicUrl}",
+                    string.Join("&", safe),
+                    parameters.ContainsKey("p"),
+                    parameters.ContainsKey("t"),
+                    parameters.ContainsKey("s"),
+                    context.Request.Headers.ContainsKey("Authorization"),
+                    _subsonicSettings.Url);
+            }
             await WriteSubsonicError(context, 40, "Wrong username or password");
             return;
         }
@@ -124,6 +149,63 @@ public class SubsonicAuthenticationMiddleware
             return true;
         
         return false;
+    }
+
+    /// <summary>
+    /// Relay a /rest/ping request to the backing Subsonic server and return its
+    /// response verbatim. Lets a client's connectivity probe (which may carry
+    /// placeholder credentials) see a real OpenSubsonic identification instead of
+    /// this proxy's bare error body.
+    /// </summary>
+    private async Task ProxyPingAsync(HttpContext context, SubsonicRequestParser requestParser)
+    {
+        var parameters = await requestParser.ExtractAllParametersAsync(context.Request);
+        if (context.Request.Body.CanSeek)
+        {
+            context.Request.Body.Position = 0;
+        }
+
+        var format = parameters.GetValueOrDefault("f", context.Request.Query["f"].FirstOrDefault() ?? "xml");
+        var qs = new List<string>
+        {
+            $"u={Uri.EscapeDataString(parameters.GetValueOrDefault("u", ""))}",
+            $"c={Uri.EscapeDataString(parameters.GetValueOrDefault("c", "octo-fiesta"))}",
+            $"v={Uri.EscapeDataString(parameters.GetValueOrDefault("v", "1.16.1"))}",
+            $"f={Uri.EscapeDataString(format)}",
+        };
+        if (!string.IsNullOrEmpty(parameters.GetValueOrDefault("p", "")))
+        {
+            qs.Add($"p={Uri.EscapeDataString(parameters["p"])}");
+        }
+        if (!string.IsNullOrEmpty(parameters.GetValueOrDefault("t", "")))
+        {
+            qs.Add($"t={Uri.EscapeDataString(parameters["t"])}");
+        }
+        if (!string.IsNullOrEmpty(parameters.GetValueOrDefault("s", "")))
+        {
+            qs.Add($"s={Uri.EscapeDataString(parameters["s"])}");
+        }
+
+        try
+        {
+            var httpClient = _httpClientFactory.CreateClient();
+            var baseUrl = (_subsonicSettings.Url ?? string.Empty).TrimEnd('/');
+            var url = $"{baseUrl}/rest/ping?{string.Join("&", qs)}";
+            using var upstream = await httpClient.GetAsync(url);
+            var body = await upstream.Content.ReadAsStringAsync();
+
+            context.Response.StatusCode = (int)upstream.StatusCode;
+            context.Response.ContentType = upstream.Content.Headers.ContentType?.ToString()
+                ?? (format.Equals("json", StringComparison.OrdinalIgnoreCase)
+                    ? "application/json; charset=utf-8"
+                    : "application/xml; charset=utf-8");
+            await context.Response.WriteAsync(body);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to proxy /rest/ping to Subsonic server");
+            await WriteSubsonicError(context, 0, "Upstream Subsonic server unreachable");
+        }
     }
 
     private string ComputeCredentialHash(Dictionary<string, string> parameters)
@@ -202,9 +284,12 @@ public class SubsonicAuthenticationMiddleware
     private async Task WriteSubsonicError(HttpContext context, int code, string message)
     {
         var format = context.Request.Query["f"].FirstOrDefault() ?? "xml";
-        
-        context.Response.StatusCode = 401;
-        
+
+        // Subsonic convention: transport succeeds (HTTP 200), the failure is in
+        // the response body. Clients that treat a 401 as "not a Subsonic server"
+        // otherwise report a generic connection error instead of the real cause.
+        context.Response.StatusCode = 200;
+
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
         {
             context.Response.ContentType = "application/json; charset=utf-8";
@@ -213,6 +298,9 @@ public class SubsonicAuthenticationMiddleware
                     "subsonic-response": {
                         "status": "failed",
                         "version": "1.16.1",
+                        "type": "octo-fiesta",
+                        "serverVersion": "0.10.0-musichelper-lab",
+                        "openSubsonic": true,
                         "error": {
                             "code": {{code}},
                             "message": "{{message}}"
@@ -227,7 +315,7 @@ public class SubsonicAuthenticationMiddleware
             context.Response.ContentType = "application/xml; charset=utf-8";
             var xml = $"""
                 <?xml version="1.0" encoding="UTF-8"?>
-                <subsonic-response xmlns="http://subsonic.org/restapi" status="failed" version="1.16.1">
+                <subsonic-response xmlns="http://subsonic.org/restapi" status="failed" version="1.16.1" type="octo-fiesta" serverVersion="0.10.0-musichelper-lab" openSubsonic="true">
                     <error code="{code}" message="{message}"/>
                 </subsonic-response>
                 """;

@@ -168,6 +168,20 @@ var app = builder.Build();
 // Enable request body buffering FIRST to allow multiple reads (for proxy forwarding)
 app.UseRequestBodyBuffering();
 
+// Diagnostic: log every inbound request line (method + full path + query) when
+// MUSICHELPER_REQUEST_TRACE=1. Off by default.
+if (Environment.GetEnvironmentVariable("MUSICHELPER_REQUEST_TRACE") == "1")
+{
+    var traceLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("RequestTrace");
+    app.Use(async (context, next) =>
+    {
+        traceLogger.LogInformation("REQ {Method} {Path}{Query}",
+            context.Request.Method, context.Request.Path, context.Request.QueryString);
+        await next();
+        traceLogger.LogInformation("RES {Status} {Path}", context.Response.StatusCode, context.Request.Path);
+    });
+}
+
 // Validate Subsonic authentication BEFORE any endpoint processing
 // This prevents unauthenticated access to external resources
 app.UseSubsonicAuthentication();

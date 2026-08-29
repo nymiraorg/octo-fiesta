@@ -9,6 +9,7 @@ using octo_fiesta.Services.Lyrics;
 using octo_fiesta.Services.Validation;
 using octo_fiesta.Services.Subsonic;
 using octo_fiesta.Services.Common;
+using octo_fiesta.Services.MusicHelper;
 using octo_fiesta.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -38,6 +39,8 @@ builder.Services.Configure<YandexSettings>(
     builder.Configuration.GetSection("Yandex"));
 builder.Services.Configure<LyricsSettings>(
     builder.Configuration.GetSection("Lyrics"));
+builder.Services.Configure<MusicHelperSettings>(
+    builder.Configuration.GetSection("MusicHelper"));
 
 // Get the configured music service from bound settings (to respect default values)
 var subsonicSettings = new SubsonicSettings();
@@ -54,6 +57,7 @@ builder.Services.AddSingleton<SubsonicRequestParser>();
 builder.Services.AddSingleton<SubsonicResponseBuilder>();
 builder.Services.AddSingleton<SubsonicModelMapper>();
 builder.Services.AddScoped<SubsonicProxyService>();
+builder.Services.AddScoped<MusicHelperService>();
 
 // Lyrics lookup (LRCLIB). Always registered; gated at runtime by Lyrics:Enabled.
 var lyricsSettings = new LyricsSettings();

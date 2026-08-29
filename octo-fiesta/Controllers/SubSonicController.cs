@@ -12,6 +12,7 @@ using octo_fiesta.Services;
 using octo_fiesta.Services.Common;
 using octo_fiesta.Services.Local;
 using octo_fiesta.Services.Lyrics;
+using octo_fiesta.Services.MusicHelper;
 using octo_fiesta.Services.Subsonic;
 
 namespace octo_fiesta.Controllers;
@@ -30,6 +31,7 @@ public class SubsonicController : ControllerBase
     private readonly SubsonicProxyService _proxyService;
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly ILyricsService? _lyricsService;
+    private readonly MusicHelperService _musicHelperService;
     private readonly ILogger<SubsonicController> _logger;
     private readonly IHostApplicationLifetime _hostApplicationLifetime;
 
@@ -42,6 +44,7 @@ public class SubsonicController : ControllerBase
         SubsonicResponseBuilder responseBuilder,
         SubsonicModelMapper modelMapper,
         SubsonicProxyService proxyService,
+        MusicHelperService musicHelperService,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<SubsonicController> logger,
         PlaylistSyncService? playlistSyncService = null,
@@ -55,6 +58,7 @@ public class SubsonicController : ControllerBase
         _responseBuilder = responseBuilder;
         _modelMapper = modelMapper;
         _proxyService = proxyService;
+        _musicHelperService = musicHelperService;
         _hostApplicationLifetime = hostApplicationLifetime;
         _playlistSyncService = playlistSyncService;
         _lyricsService = lyricsService;
@@ -93,6 +97,11 @@ public class SubsonicController : ControllerBase
         var parameters = await ExtractAllParameters();
         var query = parameters.GetValueOrDefault("query", "");
         var format = parameters.GetValueOrDefault("f", "xml");
+
+        if (_musicHelperService.SyntheticOnly)
+        {
+            return await _musicHelperService.Search3ResponseAsync(query, format, HttpContext.RequestAborted);
+        }
         
         var cleanQuery = query.Trim().Trim('"');
         
@@ -151,6 +160,19 @@ public class SubsonicController : ControllerBase
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
+        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(id))
+        {
+            var localId = await _musicHelperService.LocalNavidromeSongIdAsync(id, HttpContext.RequestAborted);
+            if (!string.IsNullOrEmpty(localId))
+            {
+                parameters["id"] = localId;
+                return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
+            }
+
+            var requestId = await _musicHelperService.RequestHydrationAsync(id, HttpContext.RequestAborted);
+            return _musicHelperService.GhostStreamResponse(parameters.GetValueOrDefault("f", "xml"), requestId);
+        }
+
         if (!isExternal)
         {
             return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
@@ -193,6 +215,13 @@ public class SubsonicController : ControllerBase
         var format = parameters.GetValueOrDefault("f", "xml");
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(mediaId);
+        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(mediaId))
+        {
+            var musicHelperProtocol = Request.Headers["X-Forwarded-Proto"].FirstOrDefault() ?? Request.Scheme;
+            var musicHelperSong = await _musicHelperService.GetSongAsync(mediaId, HttpContext.RequestAborted);
+            return _responseBuilder.CreateTranscodeDecisionResponse(musicHelperSong, musicHelperProtocol);
+        }
+
         if (!isExternal)
         {
             try
@@ -243,6 +272,16 @@ public class SubsonicController : ControllerBase
         }
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
+
+        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(id))
+        {
+            var musicHelperSong = await _musicHelperService.GetSongAsync(id, HttpContext.RequestAborted);
+            if (musicHelperSong == null)
+            {
+                return _responseBuilder.CreateError(format, 70, "Song not found");
+            }
+            return _responseBuilder.CreateSongResponse(format, musicHelperSong);
+        }
 
         if (!isExternal)
         {
@@ -321,6 +360,13 @@ public class SubsonicController : ControllerBase
         }
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
+
+        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperArtistId(id))
+        {
+            var artist = await _musicHelperService.GetArtistAsync(HttpContext.RequestAborted);
+            var album = await _musicHelperService.GetAlbumAsync(HttpContext.RequestAborted);
+            return _responseBuilder.CreateArtistResponse(format, artist, new List<Album> { album });
+        }
 
         if (isExternal)
         {
@@ -457,6 +503,12 @@ public class SubsonicController : ControllerBase
         if (string.IsNullOrWhiteSpace(id))
         {
             return _responseBuilder.CreateError(format, 10, "Missing id parameter");
+        }
+
+        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperAlbumId(id))
+        {
+            var album = await _musicHelperService.GetAlbumAsync(HttpContext.RequestAborted);
+            return _responseBuilder.CreateAlbumResponse(format, album);
         }
         
         // Check if this is an external playlist
@@ -656,6 +708,15 @@ public class SubsonicController : ControllerBase
         if (string.IsNullOrWhiteSpace(id))
         {
             return NotFound();
+        }
+
+        if (_musicHelperService.Enabled && (
+                string.Equals(id, MusicHelperService.PlaceholderCoverArtId, StringComparison.OrdinalIgnoreCase)
+                || _musicHelperService.IsMusicHelperSongId(id)
+                || _musicHelperService.IsMusicHelperAlbumId(id)
+                || _musicHelperService.IsMusicHelperArtistId(id)))
+        {
+            return _musicHelperService.PlaceholderCoverArt();
         }
         
         // Check if this is a playlist cover art request
@@ -1030,6 +1091,11 @@ public class SubsonicController : ControllerBase
         var parameters = await ExtractAllParameters();
         var format = parameters.GetValueOrDefault("f", "xml");
 
+        if (_musicHelperService.DisableScrobbling)
+        {
+            return _responseBuilder.CreateResponse(format, "scrobble", new { });
+        }
+
         var scrobbleResolution = await ResolveExternalSongIdIfPossible(parameters, "scrobble");
         if (scrobbleResolution is { IsExternalSong: true, Resolved: false })
         {
@@ -1232,6 +1298,14 @@ public class SubsonicController : ControllerBase
     {
         // Capture credentials from any request (including catch-all)
         var parameters = await ExtractAllParameters();
+
+        if (_musicHelperService.SyntheticOnly && IsSyntheticBrowseEndpoint(endpoint))
+        {
+            return await _musicHelperService.SyntheticBrowseResponseAsync(
+                endpoint,
+                parameters.GetValueOrDefault("f", "xml"),
+                HttpContext.RequestAborted);
+        }
         
         try
         {
@@ -1250,5 +1324,16 @@ public class SubsonicController : ControllerBase
             var format = parameters.GetValueOrDefault("f", "xml");
             return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+    }
+
+    private static bool IsSyntheticBrowseEndpoint(string endpoint)
+    {
+        var normalized = endpoint.Trim('/').ToLowerInvariant();
+        return normalized is "rest/ping" or "rest/ping.view"
+            or "rest/getmusicfolders" or "rest/getmusicfolders.view"
+            or "rest/getartists" or "rest/getartists.view"
+            or "rest/getindexes" or "rest/getindexes.view"
+            or "rest/getalbumlist" or "rest/getalbumlist.view"
+            or "rest/getalbumlist2" or "rest/getalbumlist2.view";
     }
 }

@@ -31,7 +31,7 @@ public class SubsonicController : ControllerBase
     private readonly SubsonicProxyService _proxyService;
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly ILyricsService? _lyricsService;
-    private readonly MusicHelperService _musicHelperService;
+    private readonly MusicHelperService? _musicHelperService;
     private readonly ILogger<SubsonicController> _logger;
     private readonly IHostApplicationLifetime _hostApplicationLifetime;
 
@@ -44,11 +44,11 @@ public class SubsonicController : ControllerBase
         SubsonicResponseBuilder responseBuilder,
         SubsonicModelMapper modelMapper,
         SubsonicProxyService proxyService,
-        MusicHelperService musicHelperService,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<SubsonicController> logger,
         PlaylistSyncService? playlistSyncService = null,
-        ILyricsService? lyricsService = null)
+        ILyricsService? lyricsService = null,
+        MusicHelperService? musicHelperService = null)
     {
         _subsonicSettings = subsonicSettings.Value;
         _metadataService = metadataService;
@@ -98,7 +98,7 @@ public class SubsonicController : ControllerBase
         var query = parameters.GetValueOrDefault("query", "");
         var format = parameters.GetValueOrDefault("f", "xml");
 
-        if (_musicHelperService.SyntheticOnly)
+        if (_musicHelperService is { SyntheticOnly: true })
         {
             return await _musicHelperService.Search3ResponseAsync(query, format, HttpContext.RequestAborted);
         }
@@ -160,7 +160,7 @@ public class SubsonicController : ControllerBase
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
-        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(id))
+        if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperSongId(id))
         {
             var localId = await _musicHelperService.LocalNavidromeSongIdAsync(id, HttpContext.RequestAborted);
             if (!string.IsNullOrEmpty(localId))
@@ -215,7 +215,7 @@ public class SubsonicController : ControllerBase
         var format = parameters.GetValueOrDefault("f", "xml");
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(mediaId);
-        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(mediaId))
+        if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperSongId(mediaId))
         {
             var musicHelperProtocol = Request.Headers["X-Forwarded-Proto"].FirstOrDefault() ?? Request.Scheme;
             var musicHelperSong = await _musicHelperService.GetSongAsync(mediaId, HttpContext.RequestAborted);
@@ -273,7 +273,7 @@ public class SubsonicController : ControllerBase
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
-        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperSongId(id))
+        if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperSongId(id))
         {
             var musicHelperSong = await _musicHelperService.GetSongAsync(id, HttpContext.RequestAborted);
             if (musicHelperSong == null)
@@ -361,7 +361,7 @@ public class SubsonicController : ControllerBase
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
-        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperArtistId(id))
+        if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperArtistId(id))
         {
             var artist = await _musicHelperService.GetArtistAsync(HttpContext.RequestAborted);
             var album = await _musicHelperService.GetAlbumAsync(HttpContext.RequestAborted);
@@ -505,7 +505,7 @@ public class SubsonicController : ControllerBase
             return _responseBuilder.CreateError(format, 10, "Missing id parameter");
         }
 
-        if (_musicHelperService.Enabled && _musicHelperService.IsMusicHelperAlbumId(id))
+        if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperAlbumId(id))
         {
             var album = await _musicHelperService.GetAlbumAsync(HttpContext.RequestAborted);
             return _responseBuilder.CreateAlbumResponse(format, album);
@@ -710,7 +710,7 @@ public class SubsonicController : ControllerBase
             return NotFound();
         }
 
-        if (_musicHelperService.Enabled && (
+        if (_musicHelperService is { Enabled: true } && (
                 string.Equals(id, MusicHelperService.PlaceholderCoverArtId, StringComparison.OrdinalIgnoreCase)
                 || _musicHelperService.IsMusicHelperSongId(id)
                 || _musicHelperService.IsMusicHelperAlbumId(id)
@@ -1091,7 +1091,7 @@ public class SubsonicController : ControllerBase
         var parameters = await ExtractAllParameters();
         var format = parameters.GetValueOrDefault("f", "xml");
 
-        if (_musicHelperService.DisableScrobbling)
+        if (_musicHelperService is { DisableScrobbling: true })
         {
             return _responseBuilder.CreateResponse(format, "scrobble", new { });
         }
@@ -1299,7 +1299,7 @@ public class SubsonicController : ControllerBase
         // Capture credentials from any request (including catch-all)
         var parameters = await ExtractAllParameters();
 
-        if (_musicHelperService.SyntheticOnly && IsSyntheticBrowseEndpoint(endpoint))
+        if (_musicHelperService is { SyntheticOnly: true } && IsSyntheticBrowseEndpoint(endpoint))
         {
             return await _musicHelperService.SyntheticBrowseResponseAsync(
                 endpoint,

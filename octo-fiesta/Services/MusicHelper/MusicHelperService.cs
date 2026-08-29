@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Xml.Linq;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
@@ -17,10 +19,17 @@ public class MusicHelperService
     public const string ArtistId = "ext-musichelper-artist-listenbrainz-radio";
     public const string AlbumId = "ext-musichelper-album-discovery-001";
     public const string PlaceholderCoverArtId = "musichelper-placeholder";
+    // Playlist surface: Symfonium fetches remote playlist tracks live (getPlaylist)
+    // rather than persisting them via library sync, so ghosts work here.
+    public const string PlaylistIdPrefix = "ext-musichelper-playlist-";
+    public string StationPlaylistId => $"{PlaylistIdPrefix}{_settings.StationId}";
+    public bool IsMusicHelperPlaylistId(string id) =>
+        id.StartsWith(PlaylistIdPrefix, StringComparison.OrdinalIgnoreCase);
 
     private readonly HttpClient _httpClient;
     private readonly MusicHelperSettings _settings;
     private readonly SubsonicResponseBuilder _responseBuilder;
+    private readonly SubsonicProxyService _proxyService;
     private readonly ILogger<MusicHelperService> _logger;
     private StationResponse? _cachedStation;
     private DateTimeOffset _cachedUntil = DateTimeOffset.MinValue;
@@ -29,16 +38,20 @@ public class MusicHelperService
         IHttpClientFactory httpClientFactory,
         IOptions<MusicHelperSettings> settings,
         SubsonicResponseBuilder responseBuilder,
+        SubsonicProxyService proxyService,
         ILogger<MusicHelperService> logger)
     {
         _httpClient = httpClientFactory.CreateClient();
         _settings = settings.Value;
         _responseBuilder = responseBuilder;
+        _proxyService = proxyService;
         _logger = logger;
     }
 
     public bool Enabled => _settings.Enabled;
     public bool SyntheticOnly => _settings.Enabled && string.Equals(_settings.BrowseScope, "synthetic-only", StringComparison.OrdinalIgnoreCase);
+    /// <summary>Merge mode: proxy Navidrome for browse and splice the station in.</summary>
+    public bool Merge => _settings.Enabled && !SyntheticOnly;
     public bool DisableScrobbling => _settings.Enabled && _settings.DisableScrobbling;
 
     public bool IsMusicHelperSongId(string id) =>
@@ -124,51 +137,338 @@ public class MusicHelperService
         };
     }
 
+    private static string EndpointName(string endpoint)
+    {
+        var normalized = endpoint.Trim('/').ToLowerInvariant();
+        if (normalized.StartsWith("rest/")) normalized = normalized["rest/".Length..];
+        if (normalized.EndsWith(".view")) normalized = normalized[..^".view".Length];
+        return normalized;
+    }
+
+    /// <summary>
+    /// A valid, minimal albumInfo / artistInfo(2) response for a lab-station id.
+    /// The backing Navidrome has no such id, so proxying would return error 70
+    /// and cause the client to drop the whole album (and its ghost songs).
+    /// </summary>
+    public IActionResult EmptyInfoResponse(string element, string format)
+    {
+        // element is one of: "albumInfo", "artistInfo", "artistInfo2"
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            var body = new JsonObject
+            {
+                ["subsonic-response"] = new JsonObject
+                {
+                    ["status"] = "ok",
+                    ["version"] = SubsonicVersion,
+                    [element] = new JsonObject(),
+                },
+            };
+            return new ContentResult
+            {
+                Content = body.ToJsonString(),
+                ContentType = "application/json; charset=utf-8",
+                StatusCode = 200,
+            };
+        }
+        return XmlRoot(new XElement(SubsonicNamespace + element));
+    }
+
+    // Navidrome's Subsonic routes are case-sensitive camelCase and want ".view".
+    private static readonly Dictionary<string, string> CanonicalMethod = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["getartists"] = "getArtists",
+        ["getindexes"] = "getIndexes",
+        ["getalbumlist"] = "getAlbumList",
+        ["getalbumlist2"] = "getAlbumList2",
+        ["getmusicfolders"] = "getMusicFolders",
+    };
+
+    /// <summary>
+    /// Handle a browse endpoint. In synthetic-only mode the station fully
+    /// replaces the response. In merge mode the backing Navidrome response is
+    /// proxied and the station's artist/album/songs are spliced in so the client
+    /// syncs the whole real library plus the lab station.
+    /// </summary>
     public async Task<IActionResult> SyntheticBrowseResponseAsync(string endpoint, string format, CancellationToken cancellationToken)
     {
+        var name = EndpointName(endpoint);
+
+        if (Merge)
+        {
+            return await MergeBrowseResponseAsync(name, format, cancellationToken);
+        }
+
+        // ---- synthetic-only ----
         var artist = await GetArtistAsync(cancellationToken);
         var album = await GetAlbumAsync(cancellationToken);
-        var normalized = endpoint.Trim('/').ToLowerInvariant();
 
         if (format == "json")
         {
-            object payload = normalized switch
+            object payload = name switch
             {
-                "rest/ping" or "rest/ping.view" => new { status = "ok", version = SubsonicVersion },
-                "rest/getmusicfolders" or "rest/getmusicfolders.view" => new { status = "ok", version = "1.16.1", musicFolders = new { musicFolder = new[] { new { id = "musichelper-lab", name = "MusicHelper Lab" } } } },
-                "rest/getartists" or "rest/getartists.view" or "rest/getindexes" or "rest/getindexes.view" => new { status = "ok", version = "1.16.1", artists = new { index = new[] { new { name = "L", artist = new[] { _responseBuilder.ConvertArtistToJson(artist) } } } } },
-                "rest/getalbumlist" or "rest/getalbumlist.view" or "rest/getalbumlist2" or "rest/getalbumlist2.view" => new { status = "ok", version = "1.16.1", albumList = new { album = new[] { _responseBuilder.ConvertAlbumToJson(album) } }, albumList2 = new { album = new[] { _responseBuilder.ConvertAlbumToJson(album) } } },
+                "ping" => new { status = "ok", version = SubsonicVersion },
+                "getmusicfolders" => new { status = "ok", version = "1.16.1", musicFolders = new { musicFolder = new[] { new { id = "musichelper-lab", name = "MusicHelper Lab" } } } },
+                "getartists" or "getindexes" => new { status = "ok", version = "1.16.1", artists = new { index = new[] { new { name = "L", artist = new[] { _responseBuilder.ConvertArtistToJson(artist) } } } } },
+                "getalbumlist" or "getalbumlist2" => new { status = "ok", version = "1.16.1", albumList = new { album = new[] { _responseBuilder.ConvertAlbumToJson(album) } }, albumList2 = new { album = new[] { _responseBuilder.ConvertAlbumToJson(album) } } },
                 _ => new { status = "ok", version = "1.16.1" }
             };
             return _responseBuilder.CreateJsonResponse(payload);
         }
 
-        return normalized switch
+        return name switch
         {
-            "rest/ping" or "rest/ping.view" => XmlRoot(),
-            "rest/getmusicfolders" or "rest/getmusicfolders.view" => XmlRoot(
+            "ping" => XmlRoot(),
+            "getmusicfolders" => XmlRoot(
                 new XElement(SubsonicNamespace + "musicFolders",
                     new XElement(SubsonicNamespace + "musicFolder",
                         new XAttribute("id", "musichelper-lab"),
                         new XAttribute("name", "MusicHelper Lab")))),
-            "rest/getartists" or "rest/getartists.view" => XmlRoot(
+            "getartists" => XmlRoot(
                 new XElement(SubsonicNamespace + "artists",
                     new XElement(SubsonicNamespace + "index",
                         new XAttribute("name", "L"),
                         _responseBuilder.ConvertArtistToXml(artist, SubsonicNamespace)))),
-            "rest/getindexes" or "rest/getindexes.view" => XmlRoot(
+            "getindexes" => XmlRoot(
                 new XElement(SubsonicNamespace + "indexes",
                     new XElement(SubsonicNamespace + "index",
                         new XAttribute("name", "L"),
                         _responseBuilder.ConvertArtistToXml(artist, SubsonicNamespace)))),
-            "rest/getalbumlist" or "rest/getalbumlist.view" => XmlRoot(
+            "getalbumlist" => XmlRoot(
                 new XElement(SubsonicNamespace + "albumList",
                     _responseBuilder.ConvertAlbumToXml(album, SubsonicNamespace))),
-            "rest/getalbumlist2" or "rest/getalbumlist2.view" => XmlRoot(
+            "getalbumlist2" => XmlRoot(
                 new XElement(SubsonicNamespace + "albumList2",
                     _responseBuilder.ConvertAlbumToXml(album, SubsonicNamespace))),
             _ => XmlRoot()
         };
+    }
+
+    // ---- playlist surface -------------------------------------------------
+    // Symfonium fetches remote playlist tracks live via getPlaylist, so ghost
+    // tracks can be exposed here even though they won't survive library sync.
+
+    private JsonObject StationPlaylistSummary(int songCount, int totalDurationSeconds) => new()
+    {
+        ["id"] = StationPlaylistId,
+        ["name"] = "MusicHelper Lab — Discovery",
+        ["comment"] = "Not-yet-acquired recommendations. Play a track to hydrate it.",
+        ["owner"] = "musichelper",
+        ["public"] = true,
+        ["songCount"] = songCount,
+        ["duration"] = totalDurationSeconds,
+        ["created"] = DateTime.UtcNow.ToString("o"),
+        ["changed"] = DateTime.UtcNow.ToString("o"),
+        ["coverArt"] = PlaceholderCoverArtId,
+    };
+
+    /// <summary>getPlaylists: proxy Navidrome and append the synthetic station playlist.</summary>
+    public async Task<IActionResult> GetPlaylistsMergeAsync(CancellationToken cancellationToken)
+    {
+        var proxyParams = new Dictionary<string, string>(_capturedParameters, StringComparer.OrdinalIgnoreCase) { ["f"] = "json" };
+        JsonObject? proxied = null;
+        try
+        {
+            var (body, _) = await _proxyService.RelayAsync("rest/getPlaylists.view", proxyParams);
+            if (JsonNode.Parse(body) is JsonObject r && r["subsonic-response"] is JsonObject sr)
+                proxied = sr.DeepClone() as JsonObject;
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "MusicHelper merge: getPlaylists proxy failed"); }
+
+        var response = proxied ?? new JsonObject { ["status"] = "ok", ["version"] = SubsonicVersion };
+
+        int count = 0, dur = 0;
+        try
+        {
+            var ghosts = await GhostSongsAsync(cancellationToken);
+            count = ghosts.Count;
+            dur = ghosts.Sum(s => s.Duration ?? 0);
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "MusicHelper: station fetch for getPlaylists failed"); }
+
+        var container = EnsureObject(response, "playlists");
+        EnsureArray(container, "playlist").Add(StationPlaylistSummary(count, dur));
+
+        return JsonResult(response);
+    }
+
+    /// <summary>getPlaylist?id=&lt;station&gt;: return the station's ghost songs as a playlist.</summary>
+    public async Task<IActionResult> GetStationPlaylistAsync(string format, CancellationToken cancellationToken)
+    {
+        var ghosts = await GhostSongsAsync(cancellationToken);
+        var summary = StationPlaylistSummary(ghosts.Count, ghosts.Sum(s => s.Duration ?? 0));
+
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            var entry = summary.DeepClone()!.AsObject();
+            var arr = new JsonArray();
+            foreach (var s in ghosts)
+                arr.Add(JsonSerializer.SerializeToNode(_responseBuilder.ConvertSongToJson(s)));
+            entry["entry"] = arr;
+            return JsonResult(new JsonObject { ["status"] = "ok", ["version"] = SubsonicVersion, ["playlist"] = entry });
+        }
+
+        var xml = new XElement(SubsonicNamespace + "playlist",
+            new XAttribute("id", StationPlaylistId),
+            new XAttribute("name", "MusicHelper Lab — Discovery"),
+            new XAttribute("songCount", ghosts.Count),
+            new XAttribute("duration", ghosts.Sum(s => s.Duration ?? 0)),
+            new XAttribute("public", "true"),
+            new XAttribute("owner", "musichelper"),
+            new XAttribute("created", DateTime.UtcNow.ToString("o")),
+            new XAttribute("coverArt", PlaceholderCoverArtId));
+        foreach (var s in ghosts)
+            xml.Add(_responseBuilder.ConvertSongToXml(s, SubsonicNamespace, StationPlaylistId));
+        return XmlRoot(xml);
+    }
+
+    /// <summary>The station's non-local tracks, as Song objects.</summary>
+    private async Task<List<Song>> GhostSongsAsync(CancellationToken cancellationToken)
+    {
+        var station = await GetStationAsync(cancellationToken);
+        return station.Tracks
+            .Where(t => !string.Equals(t.Availability, "local", StringComparison.OrdinalIgnoreCase))
+            .Select(t => ToSong(station, t))
+            .ToList();
+    }
+
+    private IActionResult JsonResult(JsonObject subsonicResponse) => new ContentResult
+    {
+        Content = new JsonObject { ["subsonic-response"] = subsonicResponse }.ToJsonString(),
+        ContentType = "application/json; charset=utf-8",
+        StatusCode = 200,
+    };
+
+    /// <summary>
+    /// Proxy Navidrome for a browse endpoint (JSON) and splice the lab station
+    /// into the result. XML falls back to a proxy-only relay so we never break
+    /// clients that ask for XML (Symfonium uses JSON).
+    /// </summary>
+    private async Task<IActionResult> MergeBrowseResponseAsync(string name, string format, CancellationToken cancellationToken)
+    {
+        var proxyParams = new Dictionary<string, string>(_capturedParameters, StringComparer.OrdinalIgnoreCase)
+        {
+            ["f"] = "json",
+        };
+
+        var canonical = CanonicalMethod.TryGetValue(name, out var m) ? m : name;
+        JsonObject? proxied = null;
+        try
+        {
+            var (body, _) = await _proxyService.RelayAsync($"rest/{canonical}.view", proxyParams);
+            if (JsonNode.Parse(body) is JsonObject root && root["subsonic-response"] is JsonObject sr)
+            {
+                // Detach from the parsed root so we can re-parent it.
+                proxied = sr.DeepClone() as JsonObject;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper merge: proxy of rest/{Endpoint} failed; returning station-only", name);
+        }
+
+        var response = proxied ?? new JsonObject
+        {
+            ["status"] = "ok",
+            ["version"] = SubsonicVersion,
+        };
+
+        try
+        {
+            switch (name)
+            {
+                case "getartists":
+                case "getindexes":
+                {
+                    var artist = await GetArtistAsync(cancellationToken);
+                    var artistsKey = name == "getindexes" ? "indexes" : "artists";
+                    var container = EnsureObject(response, artistsKey);
+                    var index = EnsureArray(container, "index");
+                    index.Add(new JsonObject
+                    {
+                        ["name"] = "☆",
+                        ["artist"] = new JsonArray { ToJsonNode(_responseBuilder.ConvertArtistToJson(artist)) },
+                    });
+                    break;
+                }
+                case "getalbumlist":
+                case "getalbumlist2":
+                {
+                    var album = await GetAlbumAsync(cancellationToken);
+                    var albumNode = ToJsonNode(_responseBuilder.ConvertAlbumToJson(album));
+                    foreach (var key in new[] { "albumList", "albumList2" })
+                    {
+                        if (response[key] is null) continue;
+                        var container = EnsureObject(response, key);
+                        EnsureArray(container, "album").Insert(0, albumNode!.DeepClone());
+                    }
+                    // if Navidrome returned neither (unlikely), add albumList2
+                    if (response["albumList"] is null && response["albumList2"] is null)
+                    {
+                        var container = EnsureObject(response, name == "getalbumlist" ? "albumList" : "albumList2");
+                        EnsureArray(container, "album").Add(albumNode);
+                    }
+                    break;
+                }
+                case "getmusicfolders":
+                {
+                    var container = EnsureObject(response, "musicFolders");
+                    EnsureArray(container, "musicFolder").Add(new JsonObject
+                    {
+                        ["id"] = "musichelper-lab",
+                        ["name"] = "MusicHelper Lab",
+                    });
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper merge: splice for rest/{Endpoint} failed", name);
+        }
+
+        var wrapper = new JsonObject { ["subsonic-response"] = response };
+        return new ContentResult
+        {
+            Content = wrapper.ToJsonString(),
+            ContentType = "application/json; charset=utf-8",
+            StatusCode = 200,
+        };
+    }
+
+    private static JsonObject EnsureObject(JsonObject parent, string key)
+    {
+        if (parent[key] is JsonObject existing) return existing;
+        var created = new JsonObject();
+        parent[key] = created;
+        return created;
+    }
+
+    private static JsonArray EnsureArray(JsonObject parent, string key)
+    {
+        if (parent[key] is JsonArray existing) return existing;
+        // Subsonic JSON collapses single-element arrays to objects; normalize.
+        if (parent[key] is JsonObject single)
+        {
+            var arr = new JsonArray { single.DeepClone() };
+            parent[key] = arr;
+            return arr;
+        }
+        var created = new JsonArray();
+        parent[key] = created;
+        return created;
+    }
+
+    private static JsonNode? ToJsonNode(object value) =>
+        JsonSerializer.SerializeToNode(value);
+
+    // The full parameter set of the current request (credentials + query args
+    // like type/size/offset), captured by the controller so a merge proxy call
+    // can forward everything Navidrome needs.
+    private Dictionary<string, string> _capturedParameters = new(StringComparer.OrdinalIgnoreCase);
+    public void CaptureCredentials(Dictionary<string, string> parameters)
+    {
+        _capturedParameters = new Dictionary<string, string>(parameters, StringComparer.OrdinalIgnoreCase);
     }
 
     public async Task<IActionResult> Search3ResponseAsync(string query, string format, CancellationToken cancellationToken)

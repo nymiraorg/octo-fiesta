@@ -83,6 +83,7 @@ public class SubsonicController : ControllerBase
     {
         var parameters = await _requestParser.ExtractAllParametersAsync(Request);
         _localLibraryService.SetSubsonicCredentials(parameters);
+        _musicHelperService?.CaptureCredentials(parameters);
         return parameters;
     }
 
@@ -1299,31 +1300,87 @@ public class SubsonicController : ControllerBase
         // Capture credentials from any request (including catch-all)
         var parameters = await ExtractAllParameters();
 
-        if (_musicHelperService is { SyntheticOnly: true } && IsSyntheticBrowseEndpoint(endpoint))
+        var syntheticFormat = parameters.GetValueOrDefault("f", "xml");
+
+        // Synthetic browse endpoints: in synthetic-only mode they fully replace the
+        // upstream response; in merge mode SyntheticBrowseResponseAsync proxies
+        // Navidrome and splices the lab station in.
+        if (_musicHelperService is { Enabled: true } && IsSyntheticBrowseEndpoint(endpoint))
         {
             return await _musicHelperService.SyntheticBrowseResponseAsync(
                 endpoint,
-                parameters.GetValueOrDefault("f", "xml"),
+                syntheticFormat,
                 HttpContext.RequestAborted);
         }
-        
+
+        // *Info endpoints for the lab station's own artist/album. Navidrome does
+        // not know these ids and returns error 70, which makes a client drop the
+        // whole album (and its ghost songs). Answer them synthetically.
+        if (_musicHelperService is { Enabled: true })
+        {
+            var infoName = IsInfoEndpoint(endpoint);
+            if (infoName is not null)
+            {
+                var infoId = parameters.GetValueOrDefault("id", "");
+                if (_musicHelperService.IsMusicHelperAlbumId(infoId)
+                    || _musicHelperService.IsMusicHelperArtistId(infoId)
+                    || _musicHelperService.IsMusicHelperSongId(infoId))
+                {
+                    return _musicHelperService.EmptyInfoResponse(infoName, syntheticFormat);
+                }
+            }
+        }
+
+        // Playlist surface: getPlaylists gets the station playlist appended;
+        // getPlaylist for the station id returns its ghost tracks live.
+        if (_musicHelperService is { Enabled: true })
+        {
+            var epName = IsInfoEndpoint(endpoint) is null
+                ? endpoint.Trim('/').ToLowerInvariant().Replace("rest/", "").Replace(".view", "")
+                : "";
+            if (epName is "getplaylists")
+            {
+                return await _musicHelperService.GetPlaylistsMergeAsync(HttpContext.RequestAborted);
+            }
+            if (epName is "getplaylist"
+                && _musicHelperService.IsMusicHelperPlaylistId(parameters.GetValueOrDefault("id", "")))
+            {
+                return await _musicHelperService.GetStationPlaylistAsync(syntheticFormat, HttpContext.RequestAborted);
+            }
+        }
+
         try
         {
             var result = await _proxyService.RelayRequestAsync(endpoint, Request, HttpContext.RequestAborted);
-            
+
             if (result.StatusCode >= 400)
             {
                 return StatusCode(result.StatusCode);
             }
-            
+
             var contentType = result.ContentType ?? "application/xml; charset=utf-8";
             return File(result.Body, contentType);
         }
         catch (HttpRequestException ex)
         {
-            var format = parameters.GetValueOrDefault("f", "xml");
-            return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
+            return _responseBuilder.CreateError(syntheticFormat, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+    }
+
+    // Returns the canonical *Info method name if this is one, else null.
+    private static string? IsInfoEndpoint(string endpoint)
+    {
+        var n = endpoint.Trim('/').ToLowerInvariant();
+        if (n.StartsWith("rest/")) n = n["rest/".Length..];
+        if (n.EndsWith(".view")) n = n[..^".view".Length];
+        return n switch
+        {
+            "getalbuminfo" => "albumInfo",
+            "getalbuminfo2" => "albumInfo",
+            "getartistinfo" => "artistInfo",
+            "getartistinfo2" => "artistInfo2",
+            _ => null,
+        };
     }
 
     private static bool IsSyntheticBrowseEndpoint(string endpoint)

@@ -733,6 +733,16 @@ public class SubsonicResponseBuilder
             return ("mp3", "audio/mpeg", 128);
         }
 
+        // MusicHelper ghost tracks are not yet acquired, but clients (Symfonium)
+        // drop songs with size/bitRate 0. Advertise a plausible placeholder
+        // format so the ghost stays visible and queueable; the real file arrives
+        // after hydration.
+        if (!string.IsNullOrEmpty(song.ExternalProvider)
+            && song.ExternalProvider.Equals("musichelper", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return ("flac", "audio/flac", 1000);
+        }
+
         // Default for external providers (Deezer, Qobuz, SquidWTF) without cached file
         return ("Remote", "audio/mpeg", 0);
     }

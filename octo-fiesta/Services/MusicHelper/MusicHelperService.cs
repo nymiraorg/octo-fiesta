@@ -54,16 +54,31 @@ public class MusicHelperService
     public bool Merge => _settings.Enabled && !SyntheticOnly;
     public bool DisableScrobbling => _settings.Enabled && _settings.DisableScrobbling;
 
+    public const string SongIdPrefix = "ext-musichelper-song-";
+    public const string ProvisionalIdPrefix = "ext-musichelper-dz-";
+
+    /// <summary>Any MusicHelper synthetic song id: a resolved MBID one or a
+    /// provisional Deezer one from search.</summary>
     public bool IsMusicHelperSongId(string id) =>
-        id.StartsWith("ext-musichelper-song-", StringComparison.OrdinalIgnoreCase);
+        id.StartsWith(SongIdPrefix, StringComparison.OrdinalIgnoreCase)
+        || id.StartsWith(ProvisionalIdPrefix, StringComparison.OrdinalIgnoreCase);
+
+    public bool IsProvisionalSongId(string id) =>
+        id.StartsWith(ProvisionalIdPrefix, StringComparison.OrdinalIgnoreCase);
+
+    public long? DeezerTrackIdFromSongId(string id)
+    {
+        if (!IsProvisionalSongId(id)) return null;
+        return long.TryParse(id[ProvisionalIdPrefix.Length..].Trim(), out var v) ? v : null;
+    }
 
     public string? RecordingMbidFromSongId(string id)
     {
-        if (!IsMusicHelperSongId(id))
+        if (!id.StartsWith(SongIdPrefix, StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
-        return id["ext-musichelper-song-".Length..].Trim().ToLowerInvariant();
+        return id[SongIdPrefix.Length..].Trim().ToLowerInvariant();
     }
 
     public bool IsMusicHelperArtistId(string id) =>
@@ -102,6 +117,46 @@ public class MusicHelperService
         var station = await GetStationAsync(cancellationToken);
         var track = station.Tracks.FirstOrDefault(t => string.Equals(t.RecordingMbid, mbid, StringComparison.OrdinalIgnoreCase));
         return track is null ? null : ToSong(station, track);
+    }
+
+    /// <summary>A valid getSong response for a provisional search result id,
+    /// echoing the same id (the client already has artist/title from search3).</summary>
+    public IActionResult ProvisionalGetSongResponse(string id, string format)
+    {
+        var song = new JsonObject
+        {
+            ["id"] = id,
+            ["parent"] = AlbumId,
+            ["isDir"] = false,
+            ["title"] = "Track",
+            ["album"] = STATION_ALBUM_FALLBACK,
+            ["artist"] = "MusicHelper",
+            ["albumId"] = AlbumId,
+            ["artistId"] = ArtistId,
+            ["duration"] = 1,
+            ["track"] = 1,
+            ["discNumber"] = 1,
+            ["year"] = 0,
+            ["suffix"] = "flac",
+            ["contentType"] = "audio/flac",
+            ["bitRate"] = 1000,
+            ["size"] = 125000,
+            ["type"] = "music",
+            ["isVideo"] = false,
+            ["isExternal"] = true,
+            ["coverArt"] = PlaceholderCoverArtId,
+        };
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            return JsonResult(new JsonObject { ["status"] = "ok", ["version"] = SubsonicVersion, ["song"] = song });
+        }
+        return XmlRoot(new XElement(SubsonicNamespace + "song",
+            new XAttribute("id", id),
+            new XAttribute("title", "Track"),
+            new XAttribute("isExternal", "true"),
+            new XAttribute("suffix", "flac"),
+            new XAttribute("contentType", "audio/flac"),
+            new XAttribute("duration", "1")));
     }
 
     public async Task<Album> GetAlbumAsync(CancellationToken cancellationToken)
@@ -336,12 +391,15 @@ public class MusicHelperService
 
     private sealed class ResolverSearchResult
     {
+        [JsonPropertyName("id")] public string Id { get; set; } = "";
+        [JsonPropertyName("deezerTrackId")] public long DeezerTrackId { get; set; }
         [JsonPropertyName("recordingMbid")] public string RecordingMbid { get; set; } = "";
         [JsonPropertyName("artist")] public string Artist { get; set; } = "";
         [JsonPropertyName("title")] public string Title { get; set; } = "";
         [JsonPropertyName("durationSeconds")] public int DurationSeconds { get; set; }
         [JsonPropertyName("availability")] public string Availability { get; set; } = "ghost";
         [JsonPropertyName("navidromeSongId")] public string? NavidromeSongId { get; set; }
+        [JsonPropertyName("score")] public int Score { get; set; }
     }
 
     private sealed class ResolverSearchResponse
@@ -349,24 +407,41 @@ public class MusicHelperService
         [JsonPropertyName("results")] public List<ResolverSearchResult> Results { get; set; } = new();
     }
 
-    private Song ResolverResultToSong(ResolverSearchResult r, int ordinal) => new()
-    {
-        Title = r.Title,
-        Artist = r.Artist,
-        ArtistId = ArtistId,
-        Album = STATION_ALBUM_FALLBACK,
-        AlbumId = AlbumId,
-        Duration = r.DurationSeconds > 0 ? r.DurationSeconds : 1,
-        Track = ordinal,
-        DiscNumber = 1,
-        CoverArtUrl = PlaceholderCoverArtId,
-        IsLocal = string.Equals(r.Availability, "local", StringComparison.OrdinalIgnoreCase),
-        ExternalProvider = Provider,
-        ExternalId = r.RecordingMbid,
-        Artists = new List<Artist> { new() { Id = ArtistId, Name = r.Artist } },
-    };
-
     private const string STATION_ALBUM_FALLBACK = "MusicHelper — Search";
+
+    /// <summary>Subsonic JSON song for a resolver search result, using its id
+    /// verbatim (ext-musichelper-dz-&lt;id&gt; for a provisional Deezer result,
+    /// ext-musichelper-song-&lt;mbid&gt; for a resolved one).</summary>
+    private static JsonObject ResolverResultToSongJson(ResolverSearchResult r, int ordinal)
+    {
+        var dur = r.DurationSeconds > 0 ? r.DurationSeconds : 1;
+        var isLocal = string.Equals(r.Availability, "local", StringComparison.OrdinalIgnoreCase);
+        return new JsonObject
+        {
+            ["id"] = r.Id,
+            ["parent"] = AlbumId,
+            ["isDir"] = false,
+            ["title"] = r.Title,
+            ["album"] = STATION_ALBUM_FALLBACK,
+            ["artist"] = r.Artist,
+            ["albumId"] = AlbumId,
+            ["artistId"] = ArtistId,
+            ["duration"] = dur,
+            ["track"] = ordinal,
+            ["discNumber"] = 1,
+            ["year"] = 0,
+            ["suffix"] = "flac",
+            ["contentType"] = "audio/flac",
+            ["bitRate"] = 1000,
+            ["size"] = (long)dur * 1000L * 125L,
+            ["type"] = "music",
+            ["isVideo"] = false,
+            ["isExternal"] = !isLocal,
+            ["displayArtist"] = r.Artist,
+            ["displayAlbumArtist"] = r.Artist,
+            ["coverArt"] = PlaceholderCoverArtId,
+        };
+    }
 
     /// <summary>
     /// Proxy Navidrome for local search matches, get external candidates from the
@@ -420,15 +495,18 @@ public class MusicHelperService
             _logger.LogWarning(ex, "MusicHelper merge search: resolver /music-helper/search failed for {Query}", query);
         }
 
-        // 3. splice external songs (skip ones already local by MBID)
+        // 3. splice external songs. Drop ones already local by recording MBID
+        //    (only known for resolved results; provisional Deezer results carry
+        //    no MBID yet, so they always show — a dedupe against the local
+        //    result set happens naturally once tapped/hydrated).
         var songArr = searchResult["song"] as JsonArray ?? new JsonArray();
         searchResult["song"] = songArr;
         var ordinal = 1;
         foreach (var r in external)
         {
-            if (string.IsNullOrEmpty(r.RecordingMbid) || localMbids.Contains(r.RecordingMbid)) continue;
-            var song = ResolverResultToSong(r, ordinal++);
-            songArr.Add(JsonSerializer.SerializeToNode(_responseBuilder.ConvertSongToJson(song)));
+            if (string.IsNullOrEmpty(r.Id)) continue;
+            if (!string.IsNullOrEmpty(r.RecordingMbid) && localMbids.Contains(r.RecordingMbid)) continue;
+            songArr.Add(ResolverResultToSongJson(r, ordinal++));
         }
 
         return JsonResult(new JsonObject
@@ -625,7 +703,7 @@ public class MusicHelperService
 
     public async Task<string?> LocalNavidromeSongIdAsync(string id, CancellationToken cancellationToken)
     {
-        var mbid = RecordingMbidFromSongId(id);
+        var mbid = await EffectiveRecordingMbidAsync(id, cancellationToken);
         if (string.IsNullOrWhiteSpace(mbid))
         {
             return null;
@@ -676,11 +754,83 @@ public class MusicHelperService
         [JsonPropertyName("navidromeSongId")] public string? NavidromeSongId { get; set; }
     }
 
+    private sealed class ResolveDeezerResponse
+    {
+        [JsonPropertyName("ok")] public bool Ok { get; set; }
+        [JsonPropertyName("recordingMbid")] public string? RecordingMbid { get; set; }
+        [JsonPropertyName("availability")] public string? Availability { get; set; }
+        [JsonPropertyName("navidromeSongId")] public string? NavidromeSongId { get; set; }
+        [JsonPropertyName("reason")] public string? Reason { get; set; }
+    }
+
+    // deezerTrackId -> resolved recording MBID ("" = tried and failed). A tap
+    // fires getSong + stream + retries; resolve the identity once.
+    private readonly Dictionary<long, string> _deezerResolveCache = new();
+
+    /// <summary>
+    /// The exact recording MBID for a synthetic song id. For a resolved
+    /// ext-musichelper-song-&lt;mbid&gt; id it's parsed directly; for a
+    /// provisional ext-musichelper-dz-&lt;id&gt; search result it's resolved
+    /// on demand via the resolver (Deezer -> ISRC -> MBID + suppression gate).
+    /// Returns null if the id is not ours or cannot be resolved to an
+    /// acquirable recording.
+    /// </summary>
+    public async Task<string?> EffectiveRecordingMbidAsync(string id, CancellationToken cancellationToken)
+    {
+        var direct = RecordingMbidFromSongId(id);
+        if (!string.IsNullOrWhiteSpace(direct))
+        {
+            return direct;
+        }
+
+        var deezerId = DeezerTrackIdFromSongId(id);
+        if (deezerId is not { } dz)
+        {
+            return null;
+        }
+
+        lock (_deezerResolveCache)
+        {
+            if (_deezerResolveCache.TryGetValue(dz, out var cached))
+            {
+                return string.IsNullOrEmpty(cached) ? null : cached;
+            }
+        }
+
+        string resolved = "";
+        try
+        {
+            var url = $"{_settings.ResolverUrl.TrimEnd('/')}/music-helper/resolve-deezer";
+            using var resp = await _httpClient.PostAsJsonAsync(url, new { deezerTrackId = dz }, cancellationToken);
+            resp.EnsureSuccessStatusCode();
+            var body = await resp.Content.ReadFromJsonAsync<ResolveDeezerResponse>(cancellationToken: cancellationToken);
+            if (body is { Ok: true } && !string.IsNullOrWhiteSpace(body.RecordingMbid))
+            {
+                resolved = body.RecordingMbid!.ToLowerInvariant();
+            }
+            else
+            {
+                _logger.LogInformation("MusicHelper: deezer {DeezerId} not resolvable ({Reason})", dz, body?.Reason);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper: resolve-deezer failed for {DeezerId}", dz);
+        }
+
+        lock (_deezerResolveCache)
+        {
+            _deezerResolveCache[dz] = resolved;
+        }
+        return string.IsNullOrEmpty(resolved) ? null : resolved;
+    }
+
     public async Task<string?> RequestHydrationAsync(string id, CancellationToken cancellationToken)
     {
-        // The recording MBID is in the synthetic id itself — works for a tapped
-        // station ghost AND a tapped search result (which is not in the station).
-        var mbid = RecordingMbidFromSongId(id);
+        // Works for a station ghost (ext-musichelper-song-<mbid>) and for a
+        // tapped search result (provisional ext-musichelper-dz-<id>, resolved
+        // to its exact recording MBID here before any acquisition job exists).
+        var mbid = await EffectiveRecordingMbidAsync(id, cancellationToken);
         if (string.IsNullOrWhiteSpace(mbid))
         {
             return null;

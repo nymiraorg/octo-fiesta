@@ -289,6 +289,10 @@ public class SubsonicController : ControllerBase
 
         if (_musicHelperService is { Enabled: true } && _musicHelperService.IsMusicHelperSongId(id))
         {
+            if (_musicHelperService.IsProvisionalSongId(id))
+            {
+                return _musicHelperService.ProvisionalGetSongResponse(id, format);
+            }
             var musicHelperSong = await _musicHelperService.GetSongAsync(id, HttpContext.RequestAborted);
             if (musicHelperSong == null)
             {

@@ -1,4 +1,26 @@
-# Octo-Fiesta
+# Octo-Fiesta — MusicHelper Lab fork
+
+> **Fork note.** This branch (`musichelper-lab-v0.10`) adds a `MusicHelper`
+> provider used by the homelab music stack. It does **not** use Octo-Fiesta's
+> native "download on stream" path. Instead:
+>
+> - Browse runs in **merge** mode (`MusicHelper__BrowseScope=merge`): the whole
+>   Navidrome library is proxied and the lab station / a "Discovery" playlist /
+>   search results are spliced in.
+> - Search calls a resolver service (`MusicHelper__ResolverUrl`) which returns
+>   Deezer-backed, re-ranked results as provisional `ext-musichelper-dz-<id>`
+>   IDs. The exact MusicBrainz recording MBID is resolved on the `/rest/stream`
+>   tap (`POST /music-helper/resolve-deezer`), before any download.
+> - Playing a not-yet-owned track returns HTTP 503 and posts a structured
+>   `ghost_hydration` request to an n8n gateway; a separate managed pipeline
+>   (VPN → Deemix → Beets → MusicBrainz verify → Navidrome) acquires it. The
+>   same provider ID then streams the real file.
+>
+> See `../music-acquisition/README.md` (section "MusicHelper Lab") and
+> `../music-acquisition/docs/RECOMMENDATION_CANDIDATE_TROUBLESHOOTING.md`.
+> The upstream behaviour described below is retained but unused in this mode.
+
+---
 
 A Subsonic API proxy server that transparently integrates multiple music streaming providers as sources. When a song is not available in your local Navidrome library, it is automatically fetched from your configured provider, downloaded, and served to your Subsonic-compatible client. The downloaded song is then added to your library, making it available locally for future listens.
 

@@ -523,10 +523,41 @@ public class MusicHelperService
         {
             return null;
         }
+
         var station = await GetStationAsync(cancellationToken);
-        return station.Tracks
+        var stationId = station.Tracks
             .FirstOrDefault(t => string.Equals(t.RecordingMbid, mbid, StringComparison.OrdinalIgnoreCase))
             ?.NavidromeSongId;
+        if (!string.IsNullOrEmpty(stationId))
+        {
+            return stationId;
+        }
+
+        // The station response is cached (both here and resolver-side, SWR). A
+        // just-hydrated track can still read as ghost there. Do a live,
+        // cache-bypassing ownership check so a post-hydration /stream tap on the
+        // unchanged synthetic id resolves to the real Navidrome song at once.
+        try
+        {
+            var url = $"{_settings.ResolverUrl.TrimEnd('/')}/music-helper/ownership/{Uri.EscapeDataString(mbid)}";
+            var live = await _httpClient.GetFromJsonAsync<OwnershipResponse>(url, cancellationToken);
+            if (live is { Local: true } && !string.IsNullOrEmpty(live.NavidromeSongId))
+            {
+                return live.NavidromeSongId;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "MusicHelper: live ownership check failed for {Mbid}", mbid);
+        }
+        return null;
+    }
+
+    private sealed class OwnershipResponse
+    {
+        [JsonPropertyName("recordingMbid")] public string RecordingMbid { get; set; } = "";
+        [JsonPropertyName("local")] public bool Local { get; set; }
+        [JsonPropertyName("navidromeSongId")] public string? NavidromeSongId { get; set; }
     }
 
     public async Task<string?> RequestHydrationAsync(string id, CancellationToken cancellationToken)

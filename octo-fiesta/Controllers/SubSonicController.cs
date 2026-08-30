@@ -103,9 +103,9 @@ public class SubsonicController : ControllerBase
         {
             return await _musicHelperService.Search3ResponseAsync(query, format, HttpContext.RequestAborted);
         }
-        
+
         var cleanQuery = query.Trim().Trim('"');
-        
+
         if (string.IsNullOrWhiteSpace(cleanQuery))
         {
             try
@@ -120,11 +120,24 @@ public class SubsonicController : ControllerBase
             }
         }
 
+        // MusicHelper merge mode: proxy Navidrome for local matches, and get
+        // external candidates from the resolver (Deezer -> ISRC -> MBID, gated)
+        // instead of upstream's provider search. Results carry stable
+        // ext-musichelper-song-<mbid> ids so a tapped result hydrates.
+        var songCount = int.TryParse(parameters.GetValueOrDefault("songCount", "20"), out var sc) ? sc : 20;
+        var albumCount = int.TryParse(parameters.GetValueOrDefault("albumCount", "20"), out var ac) ? ac : 20;
+        if (_musicHelperService is { Merge: true })
+        {
+            var localRelay = await _proxyService.RelaySafeAsync("rest/search3", parameters);
+            return await _musicHelperService.MergeSearch3Async(
+                cleanQuery, songCount, localRelay, format, HttpContext.RequestAborted);
+        }
+
         var subsonicTask = _proxyService.RelaySafeAsync("rest/search3", parameters);
         var externalTask = _metadataService.SearchAllAsync(
             cleanQuery,
-            int.TryParse(parameters.GetValueOrDefault("songCount", "20"), out var sc) ? sc : 20,
-            int.TryParse(parameters.GetValueOrDefault("albumCount", "20"), out var ac) ? ac : 20,
+            songCount,
+            albumCount,
             int.TryParse(parameters.GetValueOrDefault("artistCount", "20"), out var arc) ? arc : 20
         );
         

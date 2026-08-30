@@ -332,6 +332,113 @@ public class MusicHelperService
             .ToList();
     }
 
+    // ---- search (merge mode) -------------------------------------------------
+
+    private sealed class ResolverSearchResult
+    {
+        [JsonPropertyName("recordingMbid")] public string RecordingMbid { get; set; } = "";
+        [JsonPropertyName("artist")] public string Artist { get; set; } = "";
+        [JsonPropertyName("title")] public string Title { get; set; } = "";
+        [JsonPropertyName("durationSeconds")] public int DurationSeconds { get; set; }
+        [JsonPropertyName("availability")] public string Availability { get; set; } = "ghost";
+        [JsonPropertyName("navidromeSongId")] public string? NavidromeSongId { get; set; }
+    }
+
+    private sealed class ResolverSearchResponse
+    {
+        [JsonPropertyName("results")] public List<ResolverSearchResult> Results { get; set; } = new();
+    }
+
+    private Song ResolverResultToSong(ResolverSearchResult r, int ordinal) => new()
+    {
+        Title = r.Title,
+        Artist = r.Artist,
+        ArtistId = ArtistId,
+        Album = STATION_ALBUM_FALLBACK,
+        AlbumId = AlbumId,
+        Duration = r.DurationSeconds > 0 ? r.DurationSeconds : 1,
+        Track = ordinal,
+        DiscNumber = 1,
+        CoverArtUrl = PlaceholderCoverArtId,
+        IsLocal = string.Equals(r.Availability, "local", StringComparison.OrdinalIgnoreCase),
+        ExternalProvider = Provider,
+        ExternalId = r.RecordingMbid,
+        Artists = new List<Artist> { new() { Id = ArtistId, Name = r.Artist } },
+    };
+
+    private const string STATION_ALBUM_FALLBACK = "MusicHelper — Search";
+
+    /// <summary>
+    /// Proxy Navidrome for local search matches, get external candidates from the
+    /// resolver (Deezer -> ISRC -> MBID, ownership/suppression gated), and splice
+    /// them into one searchResult3. External hits already present locally (same
+    /// recording MBID) are dropped so a track shows once.
+    /// </summary>
+    public async Task<IActionResult> MergeSearch3Async(
+        string query,
+        int songLimit,
+        (byte[]? Body, string? ContentType, bool Success) localRelay,
+        string format,
+        CancellationToken cancellationToken)
+    {
+        // 1. local (proxied Navidrome) searchResult3
+        JsonObject searchResult;
+        var localMbids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (localRelay.Success && localRelay.Body is { Length: > 0 }
+            && JsonNode.Parse(localRelay.Body) is JsonObject relayRoot
+            && relayRoot["subsonic-response"] is JsonObject relaySr
+            && relaySr["searchResult3"] is JsonObject relaySearch)
+        {
+            searchResult = relaySearch.DeepClone()!.AsObject();
+            if (searchResult["song"] is JsonArray songs)
+            {
+                foreach (var s in songs)
+                {
+                    var mb = s?["musicBrainzId"]?.GetValue<string>();
+                    if (!string.IsNullOrEmpty(mb)) localMbids.Add(mb!);
+                }
+            }
+        }
+        else
+        {
+            searchResult = new JsonObject();
+        }
+
+        // 2. resolver external search
+        List<ResolverSearchResult> external = new();
+        try
+        {
+            var url = $"{_settings.ResolverUrl.TrimEnd('/')}/music-helper/search";
+            using var resp = await _httpClient.PostAsJsonAsync(
+                url, new { query, limit = Math.Clamp(songLimit, 1, 20) }, cancellationToken);
+            resp.EnsureSuccessStatusCode();
+            var parsed = await resp.Content.ReadFromJsonAsync<ResolverSearchResponse>(cancellationToken: cancellationToken);
+            external = parsed?.Results ?? new();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper merge search: resolver /music-helper/search failed for {Query}", query);
+        }
+
+        // 3. splice external songs (skip ones already local by MBID)
+        var songArr = searchResult["song"] as JsonArray ?? new JsonArray();
+        searchResult["song"] = songArr;
+        var ordinal = 1;
+        foreach (var r in external)
+        {
+            if (string.IsNullOrEmpty(r.RecordingMbid) || localMbids.Contains(r.RecordingMbid)) continue;
+            var song = ResolverResultToSong(r, ordinal++);
+            songArr.Add(JsonSerializer.SerializeToNode(_responseBuilder.ConvertSongToJson(song)));
+        }
+
+        return JsonResult(new JsonObject
+        {
+            ["status"] = "ok",
+            ["version"] = SubsonicVersion,
+            ["searchResult3"] = searchResult,
+        });
+    }
+
     private IActionResult JsonResult(JsonObject subsonicResponse) => new ContentResult
     {
         Content = new JsonObject { ["subsonic-response"] = subsonicResponse }.ToJsonString(),
@@ -524,19 +631,11 @@ public class MusicHelperService
             return null;
         }
 
-        var station = await GetStationAsync(cancellationToken);
-        var stationId = station.Tracks
-            .FirstOrDefault(t => string.Equals(t.RecordingMbid, mbid, StringComparison.OrdinalIgnoreCase))
-            ?.NavidromeSongId;
-        if (!string.IsNullOrEmpty(stationId))
-        {
-            return stationId;
-        }
-
-        // The station response is cached (both here and resolver-side, SWR). A
-        // just-hydrated track can still read as ghost there. Do a live,
-        // cache-bypassing ownership check so a post-hydration /stream tap on the
-        // unchanged synthetic id resolves to the real Navidrome song at once.
+        // Live, cache-bypassing MBID-exact ownership check first. Fast, and it
+        // works for a tapped search result (not in the station) as well as a
+        // just-hydrated track (station still says ghost). The station is a
+        // secondary source; fetching it can block on a cold SWR rebuild, so we
+        // only fall back to it if the live check is inconclusive.
         try
         {
             var url = $"{_settings.ResolverUrl.TrimEnd('/')}/music-helper/ownership/{Uri.EscapeDataString(mbid)}";
@@ -545,12 +644,29 @@ public class MusicHelperService
             {
                 return live.NavidromeSongId;
             }
+            if (live is not null)
+            {
+                // definitive "not local" — don't pay for a station fetch
+                return null;
+            }
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "MusicHelper: live ownership check failed for {Mbid}", mbid);
         }
-        return null;
+
+        try
+        {
+            var station = await GetStationAsync(cancellationToken);
+            return station.Tracks
+                .FirstOrDefault(t => string.Equals(t.RecordingMbid, mbid, StringComparison.OrdinalIgnoreCase))
+                ?.NavidromeSongId;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "MusicHelper: station fallback lookup failed for {Mbid}", mbid);
+            return null;
+        }
     }
 
     private sealed class OwnershipResponse
@@ -562,8 +678,10 @@ public class MusicHelperService
 
     public async Task<string?> RequestHydrationAsync(string id, CancellationToken cancellationToken)
     {
-        var song = await GetSongAsync(id, cancellationToken);
-        if (song?.ExternalId is null)
+        // The recording MBID is in the synthetic id itself — works for a tapped
+        // station ghost AND a tapped search result (which is not in the station).
+        var mbid = RecordingMbidFromSongId(id);
+        if (string.IsNullOrWhiteSpace(mbid))
         {
             return null;
         }
@@ -575,9 +693,9 @@ public class MusicHelperService
             {
                 source = "webhook",
                 requester = "musichelper-lab",
-                rawInput = $"ghost stream {song.ExternalId}",
+                rawInput = $"ghost stream {mbid}",
                 intent = "track",
-                recordingMbid = song.ExternalId,
+                recordingMbid = mbid,
                 requestType = "ghost_hydration",
                 options = new { dryRun = false, executionMode = "queue_only", claimAndRun = false, claimLimit = 10 }
             })

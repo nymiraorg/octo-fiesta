@@ -96,8 +96,21 @@ public class SubsonicController : ControllerBase
     public async Task<IActionResult> Search3()
     {
         var parameters = await ExtractAllParameters();
-        var query = parameters.GetValueOrDefault("query", "");
+        var rawQuery = parameters.GetValueOrDefault("query", "");
         var format = parameters.GetValueOrDefault("f", "xml");
+
+        // Auto-acquire trigger: a query prefixed with AutoAcquirePrefix (e.g. "!get")
+        // also fires acquisition of the top match. The prefix is stripped so
+        // Navidrome/resolver search the real query.
+        var prefix = _musicHelperService?.AutoAcquirePrefix ?? "";
+        var autoAcquire = false;
+        var query = rawQuery;
+        if (!string.IsNullOrEmpty(prefix) && rawQuery.Trim().StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            autoAcquire = true;
+            query = rawQuery.Trim().Substring(prefix.Length).Trim();
+            parameters["query"] = query;
+        }
 
         if (_musicHelperService is { SyntheticOnly: true })
         {
@@ -129,8 +142,14 @@ public class SubsonicController : ControllerBase
         if (_musicHelperService is { Merge: true })
         {
             var localRelay = await _proxyService.RelaySafeAsync("rest/search3", parameters);
-            return await _musicHelperService.MergeSearch3Async(
+            var merged = await _musicHelperService.MergeSearch3Async(
                 cleanQuery, songCount, localRelay, format, HttpContext.RequestAborted);
+            if (autoAcquire)
+            {
+                var fired = await _musicHelperService.AutoAcquireAsync(cleanQuery, HttpContext.RequestAborted);
+                _logger.LogInformation("MusicHelper auto-acquire: {Count} request(s) fired for {Query}", fired, cleanQuery);
+            }
+            return merged;
         }
 
         var subsonicTask = _proxyService.RelaySafeAsync("rest/search3", parameters);

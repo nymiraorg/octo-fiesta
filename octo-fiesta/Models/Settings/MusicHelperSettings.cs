@@ -21,4 +21,10 @@ public class MusicHelperSettings
     public string GhostResponseMode { get; set; } = "subsonic_error";
     public bool DisableScrobbling { get; set; } = true;
     public int StationCacheSeconds { get; set; } = 60;
+
+    /// <summary>Query prefix that turns a search into an auto-acquire request (e.g. "!get"). Empty disables auto-acquire.</summary>
+    public string AutoAcquirePrefix { get; set; } = "";
+
+    /// <summary>Max resolver candidates to auto-acquire per triggered search (1..5).</summary>
+    public int AutoAcquireCount { get; set; } = 1;
 }

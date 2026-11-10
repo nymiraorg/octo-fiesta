@@ -53,6 +53,8 @@ public class MusicHelperService
     /// <summary>Merge mode: proxy Navidrome for browse and splice the station in.</summary>
     public bool Merge => _settings.Enabled && !SyntheticOnly;
     public bool DisableScrobbling => _settings.Enabled && _settings.DisableScrobbling;
+    /// <summary>Prefix that turns a search into an auto-acquire request ("" = disabled).</summary>
+    public string AutoAcquirePrefix => _settings.AutoAcquirePrefix;
 
     public const string SongIdPrefix = "ext-musichelper-song-";
     public const string ProvisionalIdPrefix = "ext-musichelper-dz-";
@@ -864,6 +866,97 @@ public class MusicHelperService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Ghost hydration request failed for {SongId}", id);
+            return null;
+        }
+    }
+
+    /// <summary>Search the resolver and fire acquisition for the top non-local
+    /// candidate(s). Returns how many requests fired.</summary>
+    public async Task<int> AutoAcquireAsync(string query, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return 0;
+        }
+
+        var count = Math.Clamp(_settings.AutoAcquireCount, 1, 5);
+        List<ResolverSearchResult> external;
+        try
+        {
+            var url = $"{_settings.ResolverUrl.TrimEnd('/')}/music-helper/search";
+            using var resp = await _httpClient.PostAsJsonAsync(url, new { query, limit = Math.Min(count * 3, 20) }, cancellationToken);
+            resp.EnsureSuccessStatusCode();
+            var parsed = await resp.Content.ReadFromJsonAsync<ResolverSearchResponse>(cancellationToken: cancellationToken);
+            external = parsed?.Results ?? new();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper auto-acquire: resolver search failed for {Query}", query);
+            return 0;
+        }
+
+        var fired = 0;
+        foreach (var r in external)
+        {
+            if (fired >= count)
+            {
+                break;
+            }
+            if (string.Equals(r.Availability, "local", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var mbid = r.RecordingMbid;
+            if (string.IsNullOrWhiteSpace(mbid) && r.DeezerTrackId > 0)
+            {
+                mbid = await EffectiveRecordingMbidAsync($"{ProvisionalIdPrefix}{r.DeezerTrackId}", cancellationToken);
+            }
+            if (string.IsNullOrWhiteSpace(mbid))
+            {
+                continue;
+            }
+
+            var requestId = await FireAutoAcquireAsync(mbid, $"{r.Artist} — {r.Title}", cancellationToken);
+            if (requestId != null)
+            {
+                fired++;
+            }
+            _logger.LogInformation("MusicHelper auto-acquire: {Mbid} ({Artist} — {Title}) -> {RequestId}", mbid, r.Artist, r.Title, requestId);
+        }
+        return fired;
+    }
+
+    private async Task<string?> FireAutoAcquireAsync(string mbid, string rawInput, CancellationToken cancellationToken)
+    {
+        var secret = await ReadSecretAsync(_settings.WebhookSecretFile, cancellationToken);
+        using var request = new HttpRequestMessage(HttpMethod.Post, _settings.GatewayUrl)
+        {
+            Content = JsonContent.Create(new
+            {
+                source = "manual",
+                requester = "musichelper-lab",
+                rawInput,
+                intent = "track",
+                recordingMbid = mbid,
+                requestType = "music_request",
+                options = new { dryRun = false, executionMode = "queue_only", claimAndRun = false, claimLimit = 10 }
+            })
+        };
+        if (!string.IsNullOrWhiteSpace(secret))
+        {
+            request.Headers.TryAddWithoutValidation("X-Music-Acquisition-Secret", secret);
+        }
+
+        try
+        {
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            var payload = await response.Content.ReadFromJsonAsync<MusicRequestResponse>(cancellationToken: cancellationToken);
+            return payload?.RequestId;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MusicHelper auto-acquire: gateway POST failed for {Mbid}", mbid);
             return null;
         }
     }
